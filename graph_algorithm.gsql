@@ -1,0 +1,845 @@
+### tigerGraph中算法实现 ###
+
+
+# Degree Centrality 度中心性
+CREATE QUERY tg_degree_cent(SET<STRING> v_type, SET<STRING> e_type, SET<STRING> re_type, BOOL in_degree = TRUE, BOOL out_degree = TRUE,
+  INT top_k=100, BOOL print_accum = TRUE, STRING result_attr = "",STRING file_path = "") {
+  /*
+  计算度中心性：
+
+  v_type: 顶点类型
+  e_type: 边类型
+  re_type: 反向边，如果一个边时无向边也放入此集合
+  in_degree: TRUE:包含入度
+  out_degree: TRUE：包含出度
+  top_k: 返回分数最高的top_k
+  print_accum: 是否打印结果
+  result_attr: 度中心性结果保存的属性名
+  file_path: 保存文件路径
+  对于无向图只需要设置 e_type and indegree
+  */
+
+    # 定义变量
+    TYPEDEF TUPLE <VERTEX Vertex_ID, FLOAT score> VertexScore; # 节点度分数
+    HeapAccum<VertexScore>(top_k, score DESC) @@topScores;  # 堆栈：分数最高的top_k个节点
+    SumAccum<INT> @degree_score; # 节点度得分
+    FILE f(file_path);
+
+    # 开始计算
+    all = {v_type};
+
+    all = SELECT s FROM all:s
+      ACCUM
+        # 计算入度
+        IF in_degree THEN
+          FOREACH edge_type in re_type DO
+            s.@degree_score += s.outdegree(edge_type)
+          END
+        END,
+        # 计算出度
+        IF out_degree THEN
+          FOREACH edge_type in e_type DO
+            s.@degree_score += s.outdegree(edge_type)
+          END
+        END;
+
+    # 处理输出结果
+    IF file_path != "" THEN
+      f.println("Vertex_ID", "Degree");
+    END;
+
+    start = SELECT s FROM all:s
+      POST-ACCUM
+        IF result_attr != "" THEN s.setAttr(result_attr, s.@degree_score) END,
+        IF print_accum THEN @@topScores += VertexScore(s, s.@degree_score) END,
+        IF file_path != "" THEN f.println(s, s.@degree_score) END;
+
+    IF print_accum THEN
+      PRINT @@topScores AS top_scores;
+    END;
+
+}
+
+
+
+# pageRank
+CREATE QUERY tg_pagerank(STRING v_type, STRING e_type,
+ FLOAT max_change=0.001, INT max_iter=25, FLOAT damping=0.85, INT top_k = 100,
+ BOOL print_accum = TRUE, STRING result_attr =  "", STRING file_path = "",
+ BOOL display_edges = FALSE) {
+  /*
+  计算图中每个节点的pageRank值：
+  score = (1-damping) + damping * sum(从邻居节点获得分数)  # damping:阻尼值，超参数
+
+  满足以下两个条件之一，结束算法：
+  1. 达到最大遍历次数 max_iter; 2. 所有节点本轮遍历得分与上轮得分的差的最大值〈= max_change
+
+ v_type: 点类型           print_accum: 是否打印结果
+ e_type: 边类型           result_attr: pagerank值保存的属性名
+ max_iter：最大迭代次数                 file_path: 文件保存路径
+ top_k: 输出结果最大的top_k个点              display_edges: 是否打印边信息
+ max_change: 两轮之间最大改变阈值
+ damping: 阻尼
+
+  */
+
+
+   # 初始化变量
+   TYPEDEF TUPLE<VERTEX Vertex_ID, FLOAT score> Vertex_Score; # 自定义节点得分
+   HeapAccum<Vertex_Score>(top_k, score DESC) @@topScores; # 堆：节点得分top_k
+   MaxAccum<FLOAT> @@max_diff=9999; # 记录两轮之间分差最大值
+   SumAccum<FLOAT> @recvd_score=0;  # 记录节点从邻居节点得分
+   SumAccum<FLOAT> @score=1; # 初始化所有节点分数为1
+   SetAccum<EDGE> @@edgeSet; # 记录边
+   FILE f(file_path);
+
+   # 开始迭代
+   starts = {v_type};
+
+
+   # 结束条件
+   WHILE @@max_diff>max_change LIMIT max_iter DO
+     @@max_diff = 0;
+     v = SELECT s FROM starts:s-(e_type:e)->v_type:t
+       ACCUM t.@recvd_score += s.@score/(s.outdegree(e_type))
+       POST-ACCUM s.@score = (1-damping) + damping * s.@recvd_score,  # 计算得分
+       s.@recvd_score=0,  # 将从邻居得到分数清零
+       @@max_diff+=abs(s.@score-s.@score'); # 计算本轮迭代与上轮迭代最大差值
+   END;
+
+   # 处理输出
+   IF file_path != "" THEN
+     f.println("Vertex_ID", "PageRank");
+   END;
+
+   v = SELECT s FROM starts:s
+     POST-ACCUM
+       IF result_attr != "" THEN s.setAttr(result_attr, s.@score) END,
+       IF file_path != "" THEN f.println(s, s.@score) END,
+       IF print_accum THEN @@topScores+=Vertex_Score(s, s.@score) END;
+
+   IF print_accum THEN
+     PRINT @@topScores;
+     IF display_edges THEN
+       starts = SELECT s FROM starts:s-(e_type:e)->v_type:t
+         ACCUM @@edgeSet+=e;
+       PRINT @@edgeSet;
+     END;
+   END;
+
+}
+
+
+
+# BFS 无权重单源最短路径
+CREATE QUERY tg_shortest_ss_no_wt(VERTEX source, SET<STRING> v_type, SET<STRING> e_type,
+  INT output_limit = -1, BOOL print_accum =TRUE, STRING result_attr ="", STRING file_path ="",
+  BOOL display_edges =FALSE) {
+    /*
+     无权重最短路径：BFS
+    source: 起始点； v_type:遍历的节点类型；e_type：遍历的边类型；
+    output_limit: 输出顶点最大值; print_accm: 打印json 结果；
+    result_attr: 将距离添加到输出结果中； file_path：输出文件路径；
+    display_edges:输出边信息，可视化；
+    */
+
+    ### 定义变量 ###
+    FILE f(file_path);
+    MinAccum<INT> @dis;  # 记录点最小距离
+    OrAccum @visted;   # 记录点是否已经被访问
+    ListAccum<VERTEX> @path;  # 记录路径节点
+    SetAccum<EDGE> @@edgeSet; # 记录边信息
+
+    ### 初始化  ###
+    Source = {source};
+    Source = SELECT s FROM Source:s
+      ACCUM s.@visted+=True, s.@dis=0, s.@path=s;
+
+    # 记录结果
+    ResultSet = {source};
+
+    ### 开始计算距离和路径 ###
+    WHILE (Source.size()>0) DO
+      Source = SELECT t FROM Source:s-(e_type:e)->v_type:t WHERE t.@visted==FALSE
+          ACCUM t.@dis+=s.@dis+1, t.@path=s.@path+[t], t.@visted+=TRUE
+          ORDER BY getvid(t);
+
+      ResultSet = ResultSet UNION Source;
+    END;
+
+    ### 处理结果 ###
+    IF file_path != "" THEN
+      f.println("Vertex_ID", "Distance", "Shorest_Path");
+    END;
+
+    ResultSet = SELECT s FROM ResultSet:s
+      POST-ACCUM
+        IF result_attr != "" THEN s.setAttr(result_attr, s.@dis) END,
+        IF file_path != "" THEN f.println(s, s.@dis, s.@path) END;
+
+    IF print_accum THEN
+      IF output_limit >= 0 THEN
+        ResultSet = SELECT s FROM ResultSet:s LIMIT output_limit;
+      END;
+      PRINT ResultSet[ResultSet.@dis, ResultSet.@path];
+
+      IF display_edges THEN
+        ResultSet = SELECT s FROM ResultSet:s-(e_type:e)->v_type:t
+          ACCUM @@edgeSet+=e;
+          PRINT @@edgeSet;
+      END;
+    END;
+}
+
+
+
+# SPFA 无负权重单源最短路径
+CREATE QUERY tg_shortest_ss_pos_wt(VERTEX source, SET<STRING> v_type, SET<STRING> e_type,
+ STRING wt_attr, STRING wt_type, FLOAT epsilon = 0.001,BOOL print_accum = TRUE, INT output_limit = -1,
+ BOOL display_edges = FALSE, STRING result_attr = "", BOOL spit_to_file = FALSE,
+ STRING file_path = ""){
+  /*
+  带有正权重的最短路径：这里采用的是 SPFA
+  source:起始节点； v_type:节点类型; e_type:边类型;
+  wt_attr:边权重属性；wt_type:边权重数据类型;
+  epsilon:最小delata权重; print_accum:打印json结果；output_limit:输出最大顶点数；
+  display_edges:显示边信息; result_attr:距离属性;
+  spit_to_file:是否将结果保存到文件; file_path:结果输出路径
+  */
+
+   ### 定义变量  ###
+   MinAccum<FLOAT> @minPath=GSQL_INT_MAX;  # 初始化距离起始点距离为inf
+   MinAccum<FLOAT> @prevMinPath=-1;  # 前一次最小路径
+   OrAccum @is_candidate=FALSE;   # 节点是否激活，作为下次迭代起始点
+   SetAccum<EDGE> @@edgeSet;
+   FILE f(file_path);
+
+   ### 检查 wt_type 数据类型 ###
+   IF wt_type NOT IN ("UINT", "INT", "FLOAT", "DOUBLE") THEN
+     PRINT "wt_type must be UNIT, INT, FLOAT, DOUBLE" AS errMsg;
+     RETURN;
+   END;
+
+   ### 初始化: 起始点到自身距离为0 ####
+   start = {source};
+   start = SELECT s FROM start:s POST-ACCUM s.@minPath=0;
+
+
+   ### N-1轮迭代, 考虑边是否能够减小已知距离 ###
+   WHILE start.size() != 0 DO
+     start = SELECT t FROM start:s-(e_type:e)->v_type:t
+       ACCUM t.@is_candidate=FALSE,
+         CASE wt_type
+           WHEN "UINT" THEN
+             t.@minPath += s.@minPath + e.getAttr(wt_attr, "UINT")
+           WHEN "INT" THEN
+             t.@minPath += s.@minPath + e.getAttr(wt_attr, "INT")
+           WHEN "FLOAT" THEN
+             t.@minPath += s.@minPath + e.getAttr(wt_attr, "FLOAT")
+           WHEN "DOUBLE" THEN
+             t.@minPath += s.@minPath + e.getAttr(wt_attr, "DOUBLE")
+         END
+       # 以下操作是选出被松弛的点，即经过边e使得距离减小的点
+       POST-ACCUM
+         IF abs(t.@prevMinPath-t.@minPath) > epsilon THEN
+           t.@is_candidate=TRUE, t.@prevMinPath=t.@minPath
+         END
+       # 选出被激活的点，作为下次查询起始点
+       HAVING t.@is_candidate;
+   END;
+
+
+  ### 处理输出结果 ###
+   component = {v_type};
+   component = SELECT s FROM component:s WHERE s.@prevMinPath!=-1
+     POST-ACCUM
+       IF result_attr != "" THEN s.setAttr(result_attr, s.@minPath) END,
+       IF spit_to_file THEN f.println(s, s.@minPath) END;
+
+   IF print_accum THEN
+     IF output_limit >= 0 THEN
+       component = SELECT s FROM component:s LIMIT output_limit;
+     END;
+     PRINT component[component.@minPath as cost];
+
+     IF display_edges THEN
+       tmp = SELECT s FROM component:s-(e_type:e)->v_type:t
+       ACCUM @@edgeSet+=e;
+       PRINT @@edgeSet;
+     END;
+   END;
+
+}
+
+
+
+# bellman-ford 有负权重的单源最短路径
+CREATE QUERY tg_shortest_ss_any_wt(VERTEX source, SET<STRING> v_type, SET<STRING> e_type,
+ STRING wt_attr, STRING wt_type, INT output_limit = -1, BOOL print_accum = TRUE,
+ STRING result_attr = "", STRING file_path = "", BOOL display_edges = FALSE) {
+  /*
+  采用bellman-ford算法计算带有负权重的最短路径。
+  source: 起始节点                        print_accum: 打印json结果
+   v_type: 节点类型                       result_attr: 存放最短路径的属性
+   e_type: 边类型                         file_path: 保存结果的文件路径
+   wt_attr: 权重属性                      output_limit: 最大输出顶点数
+   wt_type: 权重数据类型                   display_edges: 是否输出边，显示
+  */
+
+   ### 定义变量 ###
+   TYPEDEF TUPLE <FLOAT dist, VERTEX pred> Path_Tuple;  # 自定义数据类型，存放<路径长度，父亲节点>
+   HeapAccum<Path_Tuple>(1, dist ASC) @minPath;  # 堆累加器：仅存放路径最短的一个
+   ListAccum<STRING> @path; # 包含顶点id的路径
+   SetAccum<EDGE> @@edgeSet; # 用于输出所有边
+   OrAccum @visted; # 顶点是否已经访问
+   FILE f(file_path);
+   INT iter;  # 迭代次数
+   OrAccum @@hasNegLoop;  # 是否包含负权环
+   STRING msg40999="There is a loop with negative length. Shortest path is undefined.";
+   EXCEPTION neg_loop_excep (40999);
+
+   ### 检查边权重数据类型  ###
+   IF wt_type NOT IN ("INT", "FLOAT", "DOUBLE") THEN
+     PRINT "wt_type must be INT, FLOAT, or DOUBLE" as errMsg;
+     RETURN;
+   END;
+
+   ### 初始化 ###
+   start = {source};
+   component = {source};  # 与起始点相连的分量
+   start = SELECT s FROM start:s
+     POST-ACCUM s.@minPath += Path_Tuple(0, s), s.@visted=TRUE, s.@path+=s.id;
+
+   ### 计算连通分量所有节点 ###
+   WHILE start.size() > 0 DO
+     start = SELECT t FROM start:s-(e_type:e)->v_type:t WHERE NOT t.@visted
+       ACCUM t.@visted=TRUE;
+     component = component UNION start;
+
+   ### 进行 iter 轮迭代，查看边能否减小顶点到起始点距离
+   iter = component.size()-1;
+
+   WHILE TRUE LIMIT iter DO
+     tmp = SELECT s FROM component:s-(e_type:e)->v_type:t
+       # 这里 s.@minPath.size()>0 保证s已经被激活，减小计算量
+       ACCUM IF s.@minPath.size()>0 THEN
+         CASE wt_type
+           WHEN "INT" THEN t.@minPath += Path_Tuple(s.@minPath.top().dist + e.getAttr(wt_attr, "INT"), s)
+           WHEN "FLOAT" THEN t.@minPath += Path_Tuple(s.@minPath.top().dist + e.getAttr(wt_attr, "FLOAT"), s)
+           WHEN "DOUBLE" THEN t.@minPath += Path_Tuple(s.@minPath.top().dist + e.getAttr(wt_attr, "DOUBLE"), s)
+         END
+       END;
+   END;
+
+   ### 检查是否存在负权环, 如果进行了N-1轮迭代，再次进行进行迭代，某些节点最短路径还能减小，则存在负权环 ###
+   component = SELECT s FROM component:s-(e_type:e)->v_type:t
+     ACCUM
+       CASE wt_type
+         WHEN "INT" THEN @@hasNegLoop+=s.@minPath.top().dist+e.getAttr(wt_attr, "INT")<t.@minPath.top().dist
+         WHEN "FLOAT" THEN @@hasNegLoop+=s.@minPath.top().dist+e.getAttr(wt_attr, "FLOAT")<t.@minPath.top().dist
+         WHEN "DOUBLE" THEN @@hasNegLoop+=s.@minPath.top().dist+e.getAttr(wt_attr, "DOUBLE")<t.@minPath.top().dist
+       END;
+
+   ### 存在负权环，抛出异常 ###
+   IF @@hasNegLoop THEN
+     RAISE neg_loop_excep (msg40999);
+   END;
+
+
+   ### 统计路径 ###
+   start = {source};
+   tmp = SELECT s FROM component:s WHERE s!=source
+     POST-ACCUM s.@visted=FALSE;
+
+   WHILE start.size()>0 LIMIT iter DO
+     start = SELECT t FROM start:s-(e_type:e)->v_type:t WHERE NOT t.@visted
+       ACCUM
+         IF s==t.@minPath.top().pred THEN
+           t.@visted = TRUE, t.@path+=s.@path, t.@path+=t.id()
+         END;
+   END;
+
+   ### 输出结果 ###
+   IF file_path != "" THEN
+     f.println("Vertex_ID", "Distence", "Shorest_Path");
+   END;
+
+   component = SELECT s FROM component:s
+     POST-ACCUM
+       IF result_attr!="" THEN s.setAttr(result_attr, s.@minPath.top().dist) END,
+       IF file_path!="" THEN f.println(s, s.@minPath.top().dist, s.@path) END;
+
+   IF print_accum THEN
+     IF output_limit >= 0 THEN
+       component = SELECT s FROM component:s LIMIT output_limit;
+     END;
+
+     PRINT component[component.@minPath.top().dist, component.@path];
+
+     IF display_edges THEN
+       tmp = SELECT s FROM component:s-(e_type:e)->v_type:t
+       ACCUM @@edgeSet+=e;
+       PRINT @@edgeSet;
+     END;
+   END;
+
+}
+
+
+
+# floyed 所有节点对最短路径
+CREATE QUERY tg_all_pairs_shortest(SET<STRING> v_type, SET<STRING> e_type,
+ STRING wt_attr, STRING wt_type, STRING result_attr = "", STRING file_path = "") FOR GRAPH transfer_network {
+  /*
+  任意两个节点之间的最短路径，时间复杂度为N^3，在较大图谱上尽量不使用，这里采用有负权的单源最短路径实现
+  v_type:节点类型； e_type:边类型
+  wt_attr:边权重属性; wt_type：边权重数据类型
+  result_attr:最短路径保存属性；file_path:文件输出路径
+  */
+   start = {v_type};
+   result = SELECT s FROM start:s
+     POST-ACCUM tg_shorest_ss_any_wt(s, v_type, e_type, wt_attr, wt_type, result_attr, file_path+s.id);
+}
+
+
+
+# Triangle count 三角形计数
+CREATE QUERY tg_tri_count(STRING v_type, STRING e_type) {
+  /*
+  统计三角形数目
+  v_type：顶点类型
+  e_type: 边类型
+  */
+  SumAccum<INT> @@cnt; # 记录三角形数目
+  SetAccum<VERTEX> @self; # 存放自身
+
+  starts = {v_type.*};
+
+  # 初始化，记录自身节点
+  starts = SELECT s FROM starts:s ACCUM s.@self += s;
+
+  # 对于每条边，统计两个节点的邻居交集
+  tmp = SELECT t FROM starts:s-((e_type):e)-v_type:t
+    WHERE getvid(s)>getvid(t)  # getvid 获得节点内部id，这里保证每条边仅计算一次
+    ACCUM INT c = COUNT((s.neighbors(e_type) MINUS s.@self) INTERSECT (t.neighbors(e_type) MINUS t.@self)),
+    @@cnt += c;
+
+  # 由于每条边统计了三次，结果除以3
+  PRINT @@cnt/3 AS num_triangles;
+}
+
+
+# Label Propagation Algorithm (LPA)标签传播算法
+
+CREATE QUERY tg_label_prop(SET<STRING> v_type, SET<STRING> e_type, INT max_iter, INT output_limit,
+  BOOL print_accum = TRUE, STRING file_path = "", STRING attr = "") {
+  /*
+  标签传播算法：给每个顶点初始化一个单独的社区值，根据标签传播，确定各个节点最终社区值
+
+    v_type: 节点类型
+    e_type: 边类型
+    max_iter：最大迭代次数
+    output_limit：输出结果个数
+    print_accum：是否打印结果
+    file_path：文件输出路径
+    attr:社区ID存储属性
+
+  */
+
+    # 初始化变量
+    OrAccum @@changed=TRUE; # 记录是否有节点社区ID发生改变
+    MapAccum<INT, INT> @map;  # <社区id, 包含该id的邻居个数>
+    MapAccum<INT, INT> @@commSizes; # <社区id，包含节点个数>
+    SumAccum<INT> @label, @num; # 标签值，标签个数
+    FILE f(file_path);
+    start = {v_type};
+
+
+    # 采用tigerGraph内置id，初始化每个节点的社区id
+    start = SELECT s FROM start:s ACCUM s.@label=getvid(s);
+
+    # 将标签传给邻居，迭代停止条件：1）所有标签不变 2）达到最大迭代次数
+    WHILE @@changed==TRUE LIMIT max_iter DO
+      @@changed = FALSE;
+      start = SELECT s FROM start:s-(e_type:e)->:t
+        ACCUM t.@map += (s.@label->1)   # 将s标签传给t，记录不同标签个数
+        POST-ACCUM
+          INT maxV = 0,
+          INT label = 0, # 临时变量，存储标签最大数量及其对应标签
+          # 迭代t的字典，找出数量最多的标签
+          FOREACH (k, v) in t.@map DO
+            CASE WHEN v > maxV THEN
+              maxV = v,
+              label = k
+            END
+          END,
+          # 查看标签是否有变化：存在标签+新标签+新标签个数大于之前值
+          CASE WHEN label!=0 AND t.@label!=label AND maxV>t.@num THEN
+            @@changed += TRUE,  # 发现新的最大值标签，更新以下变量
+            t.@label = label,
+            t.@num = maxV
+          END,
+          t.@map.clear();  # 清空本轮迭代信息
+    END;
+
+
+    # 处理输出结果
+    start = {v_type};
+    start = SELECT s FROM start:s
+      POST-ACCUM
+        IF attr != "" THEN s.setAttr(attr, s.@label) END,  # 将社区ID赋值给属性attr
+        IF file_path != "" THEN f.println(s, s.@label) END,
+        IF print_accum THEN @@commSizes += (s.@label->1) END
+      LIMIT output_limit;
+
+    IF print_accum THEN
+      PRINT @@commSizes;
+      PRINT start[start.@label];
+    END;
+}
+
+
+
+# local cluster component (局部聚集系数)
+CREATE QUERY tg_lcc(STRING v_type, STRING e_type,INT top_k=100,BOOL print_accum = True, STRING result_attr = "",
+  STRING file_path = "", BOOL display_edges = FALSE) {
+  /*
+  计算局部聚集系数
+
+  lcc = Number_triangles/((n-1)n/2) # Number_triangles:包含顶点的三角形个数，n是顶点的出度
+
+
+  v_type: 顶点类型                print_accum: 是否打印结果
+  e_type: 边类型                  result_attr: 保存结果的属性名
+  top_k: 输出分数最高的top_k          file_path: 结果输出路径
+  display_edges: 是否显示边
+  */
+
+
+    # 初始化变量
+    TYPEDEF TUPLE<VERTEX Vertex_ID, FLOAT score> VertexScore;  # 自定义元组，保存节点id和分数
+    HeapAccum<VertexScore>(top_k, score DESC) @@topScores;  # 堆：用于找出得分最高的top_k个节点
+    SumAccum<FLOAT> @tri; # 记录节点包含的三角形个数
+    SumAccum<FLOAT> @lcc; # 记录节点局部聚集系数
+    SetAccum<INT> @neighbors; # 存放邻居节点
+    OrAccum @self_con; # 是否自己和自己相连
+    SetAccum<EDGE> @@edgeSet; # 记录需要显示的边
+    FILE f(file_path);
+
+
+    # 开始计算
+
+    # 计算节点的邻居节点
+    start = {v_type};
+    start = SELECT s FROM start:s-(e_type)-v_type:t
+      ACCUM
+        IF getvid(s) != getvid(t) THEN
+          t.@neighbors += getvid(s)
+        ELSE
+          t.@self_con += TRUE  # 判断是否自连
+        END;
+
+    # 计算lcc
+    start = SELECT s FROM start:s-(e_type)-v_type:t WHERE s.outdegree(e_type)>1
+      ACCUM
+        s.@tri += count((s.@neighbors INTERSECT t.@neighbors))
+      POST-ACCUM
+        IF s.@self_con AND s.outdegree(e_type) < 3 THEN  # 此时不存在邻居相连的边
+          s.@lcc += 0
+        ELSE IF s.@self_con AND s.outdegree(e_type) > 2 THEN  # 此时存在自链接，并且存在其他三角形
+          s.@lcc += ((s.@tri+1-s.outdegree(e_type)) / ((s.outdegree(e_type)-2)*(s.outdegree(e_type)-1))) # 在计算三角形个数时，每次计算一个邻居节点，会多计算一个自循环三角形
+        ELSE
+          s.@lcc += ((s.@tri) / ((s.outdegree(e_type))*(s.outdegree(e_type)-1)))  # 计算所有邻居节点的边时，为什么没有除2？
+        END;
+
+    # 处理输出
+    IF file_path != "" THEN
+      f.println("Vertex_ID", "lcc");
+    END;
+
+    start = SELECT s FROM start:s
+      POST-ACCUM
+        IF result_attr != "" THEN s.setAttr(result_attr, s.@lcc) END,
+        IF print_accum THEN @@topScores += VertexScore(s, s.@lcc) END,
+        IF file_path != "" THEN f.println(s, s.@lcc) END;
+
+
+    IF print_accum THEN
+      PRINT @@topScores AS top_scores;
+      IF display_edges THEN
+        PRINT start[start.@lcc];
+        start = SELECT s FROM start:s-(e_type:e)->:t ACCUM @@edgeSet+=e;
+        PRINT @@edgeSet;
+      END;
+    END;
+}
+
+
+# weekly connection component (弱连通分量)
+CREATE QUERY tg_wcc(SET<STRING> v_type, SET<STRING> e_type, INT output_limit = 100,
+ BOOL print_accum = TRUE, STRING result_attr = "", STRING file_path = "")  {
+  /*
+  计算无向图的弱连通分量
+  初始化时，每个节点的连通分量id为自身内部id，通过循环，不断的将连通分量中最小的id传遍整个连通分量
+
+
+  v_type: 节点类型        print_accum: 是否打印结果
+  e_type: 边类型           result_attr: 连通分量id保存的属性名
+  file_path: 结果输出文件路径    display_edges: 是否显示边，打印边
+  output_limit: 输出节点个数
+  */
+
+
+   # 初始化变量
+   MinAccum<INT> @cc_id=0;  # 节点连通分量id
+   MapAccum<INT, INT> @@compSizes; # 连通分量id：节点个数
+   MapAccum<INT, ListAccum<INT>> @@compGroupBySize; # 根据连通分量大小进行分组，连通分量大小：[连通分量id]
+   FILE f(file_path);
+   start = {v_type};
+
+   # 初始化连通分量id
+   start = SELECT s FROM start:s
+     POST-ACCUM s.@cc_id = getvid(s);
+
+   # 循环遍历，直到所有节点cc_id不在发生改变，连通分量id为整个分量中内在id最小的点
+   WHILE (start.size()>0) DO
+     start = SELECT t FROM start:s-(e_type:e)-v_type:t
+       ACCUM t.@cc_id += s.@cc_id   # 如果s.@cc_id比t.@cc_id小，将s.@cc_id赋值给t
+       HAVING t.@cc_id != t.@cc_id'; # 仅保留cc_id发生变化的点进入下一轮循环
+   END;
+
+   # 处理输出
+   IF file_path != "" THEN
+     f.println("Vertex_ID", "Component_ID");
+   END;
+
+   start = {v_type};
+   start = SELECT s FROM start:s
+     POST-ACCUM
+       IF result_attr != "" THEN s.setAttr(result_attr, s.@cc_id) END,
+       IF print_accum THEN @@compGroupBySize += (s.@cc_id->1) END,
+       IF file_path != "" THEN f.println(s, s.@cc_id) END;
+
+   IF print_accum THEN
+     IF output_limit >= 0 THEN
+       start = SELECT s FROM start:s LIMIT output_limit;
+     END;
+     FOREACH (compID, comp_size) IN @@compSizes DO
+       @@compGroupBySize += (comp_size->compID);
+     END;
+
+     PRINT @@compGroupBySize;
+     PRINT @@compSizes AS sizes;
+   END;
+
+}
+
+
+# Rocha–Thatte 环发现
+CREATE QUERY tg_cycle_detection(SET<STRING> v_type, SET<STRING> e_type, INT depth, BOOL print_accum = TRUE, STRING file_path = "") {
+  /*
+  Rocha–Thatte 算法查找图谱中存在的环，针对有向图
+
+  v_type:节点类型
+  e_type:边类型
+  depth:循环遍历的深度，这里只能发现长度最长为depth的环
+  print_accum：是否打印结果信息
+  file_path:结果输出路径
+  */
+
+  # 初始化变量
+  ListAccum<ListAccum<VERTEX>> @curList, @newList; # 分别存放点当前已经存在的路径列表，添加当前节点更新后的列表
+  ListAccum<ListAccum<VERTEX>> @@cycles; # 存放发现的环
+  SumAccum<INT> @uid;
+  FILE f(file_path);
+
+  # 初始化
+  active = {v_type}; # 所有节点为激活状态
+  active = SELECT s FROM active:s ACCUM s.@curList=[s]; # 开始每个节点的当前路径只包含本身节点
+
+  # 开始循环遍历
+  WHILE active.size()>0 LIMIT depth DO
+    active = SELECT t FROM active:s-(e_type:e)->:t
+      ACCUM
+        FOREACH p IN s.@curList DO # 将父亲节点当前所有路径传给子节点
+          BOOL t_is_min = TRUE,  # 标记t是否为路径中id最小值，主要用于环过滤
+          IF t==p.get(0) THEN # t是路径的第一个节点，发现环
+            FOREACH v IN p DO # 遍历路径p，看t是否为最小的id
+              IF getvid(v) < getvid(t) THEN
+                t_is_min = FALSE,
+                BREAK
+              END
+            END,
+            IF t_is_min == TRUE THEN  # 此时t是环路中第一个节点且是环路中id最小的，将该路径返回
+              IF print_accum THEN @@cycles += p END,
+              IF file_path != "" THEN f.println(p) END
+            END
+          ELSE IF p.contains(t) == FALSE THEN  # 如果包含t，则环路在其他路径已经发现，这里只处理不包含t的情况
+            t.@newList += [p + [t]]
+          END
+        END
+      POST-ACCUM
+        s.@curList.clear(),
+        t.@curList = t.@newList, # 更新当前节点的更新后的所有路径
+        t.@newList.clear()
+      HAVING t.@curList.size() > 0; # 如果一轮更新没有收到其他新的路径，则该节点失活；筛选出激活的节点
+  END;
+
+  IF print_accum THEN
+    PRINT @@cycles AS cycles;
+  END;
+}
+
+
+# random_walk (随机游走算法)
+CREATE QUERY tg_random_walk(int step, int path_size, string filepath, set<string> edge_types, int sample_num){
+  /*
+  随机游走step步，采样path_size长的路径
+
+  step: 随机游走的步数
+  path_size：采样路径长度
+  file_path: 输出文件路径
+  edge_types: 游走通过的边类型
+  sample_num: 当节点出度比较多时，随机采样边的个数
+  */
+
+  # 初始化变量
+  FILE f(filepath);
+  ListAccum<ListAccum<VERTEX>> @recv_seque; # 节点收到的路径列表
+  ListAccum<ListAccum<VERTEX>> @sent_seque; # 节点传到下一个节点的路径列表
+
+  # 对每个节点发送路径进行初始化,开始时仅包含自己一个节点
+  start(ANY) = {ANY};
+  start = SELECT s FROM start:s
+    POST-ACCUM s.@sent_seque += [s];
+
+  # 循环遍历
+  WHILE TRUE LIMIT step DO
+    tmp = SELECT t FROM start:s-(edge_types:e)->:t
+      SAMPLE sample_num EDGE WHEN s.outdegree() >= 1 # 当节点出度大于1时，随机对边进行采样
+      ACCUM t.@recv_seque += s.@sent_seque  # t接收s传送的路径列表
+      POST-ACCUM
+        t.@sent_seque.clear(), # 清空t传送列表
+        FOREACH p in t.@recv_seque DO  # 对接收到的路径列表进行判断
+          CASE WHEN p.size() == path_size-1 THEN  # 当接受到的列表长度为path_size-1时，加上t自身，满足要求
+            f.println(p + [t]) # 输出结果
+          ELSE
+            t.@sent_seque += p + [t]  # 未达到要求长度
+          END
+        END,
+        t.@sent_seque += [t], # 由于之前清空了t.@sent_seque，这里将[t]重新加入，表示从[t]开始的节点
+        t.@recv_seque.clear(); # 清空@recv_seque，为下一轮遍历做准备
+  END;
+}
+
+
+# Jaccard similarity (杰卡德相似性)
+CREATE QUERY tg_jaccard_nbor_ss(VERTEX source, STRING e_type, STRING rev_e_type,
+ INT top_k = 100, BOOL print_accum = TRUE, STRING similarity_edge_type = "", STRING file_path = "") {
+  /*
+  计算单源节点的`杰卡德相似性`
+  Jaccard similarity = intersection_size / (size_A + size_B - intersection_size)
+
+   source: 起始节点           top_k: 返回最相似的top_k个节点
+   e_type: 遍历的边类型        print_accum: 是否打印结果
+   rev_e_type: 反向遍历的边     file_path: csv结果文件存储路径
+   similarity_edge_type: 存储相似性的边
+
+  */
+
+   # 初始化变量
+   SumAccum<INT> @intersection_size, @@set_size_A, @set_size_B;  # 重合节点数，A邻居节点数, B邻居节点数
+   SumAccum<FLOAT> @similarity; # 相似度
+   FILE f(file_path);
+
+   # 计算邻居节点的出度
+   start(ANY) = {source};
+   start = SELECT s FROM start:s ACCUM @@set_size_A+=s.outdegree(e_type); # 根据边类型求出A的出度
+
+   # 找出起始点的所有邻居
+   subjects = SELECT t FROM start:s-(e_type:e)-:t;
+
+   # 根据邻居节点，找出所有有交集的点，并计算相似度
+   others = SELECT t FROM subjects:s-(rev_e_type:e)-:t # 根据subjects，沿着反向边找到有交集节点t
+     WHERE t!= source # 排除自身
+     ACCUM
+       t.@intersection_size += 1, # 共同节点数+1
+       t.@set_size_B = t.outdegree(e_type) # B的邻居数
+     POST-ACCUM
+       t.@similarity = t.@intersection_size*1.0/(@@set_size_A+t.@set_size_B-t.@intersection_size)
+     ORDER BY t.@similarity DESC # 按照相似度降序排列
+     LIMIT top_k;
+
+   # 处理输出结果
+   IF file_path != "" THEN
+     f.println("Vertex1", "Vertex2", "Similarity");
+   END;
+
+   others = SELECT s FROM others:s
+     POST-ACCUM
+       IF similarity_edge_type != "" THEN
+         INSERT INTO EDGE similarity_edge_type VALUES (source, s, s.@similarity)
+       END,
+       IF file_path != "" THEN
+         f.println(source, s, s.@similarity)
+       END;
+
+   IF print_accum THEN
+     PRINT others[others.@similarity];
+   END;
+
+}
+
+
+
+
+# Cosine Similarity (余弦相似性)
+CREATE QUERY tg_cosine_nbor_ss(VERTEX source, SET<STRING> e_type, SET<STRING> re_type, STRING weight, INT top_k, INT output_limit, BOOL print_accum = TRUE, STRING file_path = "", STRING similarity_edge = "") {
+  /*
+  单源节点余弦距离
+  这里将两个节点的邻居并集作为特征项
+  假如A的邻居节点为[1,2,3,4], B的邻居节点为[1,2,3,5],则特征项为[1,2,3,4,5];
+  A，B的特征向量为[1,1,1,1,0], [1,1,1,0,1],这里的1可以采用边权重进行替换
+
+
+  source:起始节点  e_type:遍历边类型
+  re_type:反向边类型  weight:边存储权重的属性
+  top_k:返回结果top_k  output_limit:输出结果数
+  print_accum:打印结果  file_path:文件输出路径
+  similarity_edge:存放结果的相似性边
+  */
+
+  # 初始化变量
+  SumAccum<FLOAT> @numerator, @@norm1, @norm2, @similarity; # 分子，向量1的平方和，向量2平方和，相似性
+  FILE f(file_path);
+
+  # 找出起始点的邻居节点，同时计算分母norm1
+  start = {source};
+  subjects = SELECT t FROM start:s-(e_type:e)->:t
+    ACCUM t.@numerator = e.getAttr(weight, "FLOAT"),
+          @@norm1 += pow(e.getAttr(weight, "FLOAT"), 2);
+
+  # 根据起始节点的邻居节点，找出与起始节点有交集的节点,同时计算分子部分
+  neighbours = SELECT t FROM subjects:s-(re_type:e)->:t
+    WHERE t!= source
+    ACCUM t.@numerator += s.@numerator * e.getAttr(weight, "FLOAT");
+
+  # 根据交集节点，计算norm2 和 相似性
+  neighbours = SELECT s FROM neighbours:s-(e_type:e)->:t
+    ACCUM s.@norm2 += pow(e.getAttr(weight, "FLOAT"), 2)
+    POST-ACCUM s.@similarity = s.@numerator / sqrt(@@norm1 * s.@norm2)
+    ORDER BY s.@similarity DESC
+    LIMIT top_k;
+
+  # 处理输出结果
+  neighbours = SELECT s FROM neighbours:s
+    POST-ACCUM
+      IF similarity_edge != "" THEN INSERT INTO EDGE similarity_edge VALUES (source, s, s.@similarity) END,
+      IF file_path != "" THEN f.println(source, s, s.@similarity) END
+    LIMIT output_limit;
+
+  IF print_accum THEN
+    PRINT neighbours[neighbours.@similarity];
+  END;
+
+}
